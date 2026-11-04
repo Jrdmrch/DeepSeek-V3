@@ -22,7 +22,7 @@ import convert as lconvert  # noqa: E402
 import estimate  # noqa: E402
 from chat import Session, fit_history  # noqa: E402
 from memory import FeedbackMemory, strip_notes  # noqa: E402
-from model import (ModelArgs, QuantLinear, build_model, fp8_block_dequant, load_model,  # noqa: E402
+from model import (Embedding, ModelArgs, QuantLinear, build_model, fp8_block_dequant, load_model,  # noqa: E402
                    quantize_int4, quantize_int8, unpack_int4)
 
 
@@ -46,6 +46,7 @@ V3_TINY = dict(vocab_size=128, dim=7168, inter_dim=64, moe_inter_dim=32, n_layer
                n_limited_groups=2, score_func="sigmoid", route_scale=2.5, q_lora_rank=64, kv_lora_rank=32,
                qk_nope_head_dim=16, qk_rope_head_dim=16, v_head_dim=16, original_seq_len=16, rope_factor=4.0)
 SEQ = 48  # > original_seq_len, so the reference applies YaRN
+COSINES = {}  # quantized-vs-float logit cosine, printed for information
 
 
 def make_reference(cfg, seed=0):
@@ -231,17 +232,30 @@ def test_convert_end_to_end(tmp_path, cfg):
 
     toks = torch.randint(0, cfg["vocab_size"], (1, 24))
     expected = ref(toks, 0)
-    results = {}
+    results, models = {}, {}
     for quant in ("none", "int8", "int4"):
         out = tmp_path / quant
         lconvert.main(str(hf_dir), str(out), quant=quant, group_size=32, dtype="fp32", shard_gb=0.001)
         assert (out / "tokenizer.json").exists()
-        model = load_model(str(out), "cpu", torch.float32, max_seq_len=SEQ)
-        results[quant] = model(toks, 0)
+        models[quant] = load_model(str(out), "cpu", torch.float32, max_seq_len=SEQ)
+        results[quant] = models[quant](toks, 0)
     torch.testing.assert_close(results["none"], expected, rtol=1e-4, atol=1e-4)
-    for quant, min_cos in (("int8", 0.995), ("int4", 0.9)):
-        cos = torch.nn.functional.cosine_similarity(results[quant], expected).item()
-        assert cos > min_cos, f"{quant}: cosine {cos:.4f}"
+    for quant in ("int8", "int4"):
+        # Exactness: the reference model loaded with the *dequantized* weights must give the same
+        # logits, so any remaining gap to `expected` is quantization error, not an implementation bug.
+        q_model = models[quant]
+        deq = {}
+        for name, mod in q_model.named_modules():
+            if isinstance(mod, QuantLinear):
+                deq[name + ".weight"] = mod.dense_weight(torch.float32)
+            elif isinstance(mod, Embedding):
+                w = mod.weight.float()
+                deq[name + ".weight"] = w if mod.scale is None else w * mod.scale[:, None]
+        ref_q = make_reference(cfg)
+        ref_q.load_state_dict(dict(sd, **deq))
+        torch.testing.assert_close(results[quant], ref_q(toks, 0), rtol=1e-4, atol=1e-4)
+        COSINES[(cfg["dim"], quant)] = torch.nn.functional.cosine_similarity(results[quant], expected).item()
+    assert COSINES[(cfg["dim"], "int8")] > 0.99  # int8 should be near-lossless even on random weights
 
 
 def test_hf_config_mapping_for_real_configs():
