@@ -1,0 +1,8 @@
+# Minimal runtime for DeepSeek-Lite (CPU, CUDA or Apple MPS). No Triton, no NCCL.
+torch>=2.1
+safetensors>=0.4
+# Tokenizer: either `transformers` (if already installed) or these two light packages
+tokenizers>=0.15
+jinja2>=3.1
+# tests only
+# pytest>=7
